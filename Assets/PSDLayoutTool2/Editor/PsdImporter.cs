@@ -2659,6 +2659,11 @@
                 return null;
             }
 
+            bool useSectionDividerInfo = flatLayers.Any(layer => layer.HasSectionDividerInfo);
+            PsdLogger.Info(
+                "Layer group detection: " +
+                (useSectionDividerInfo ? "PSD section divider" : "legacy pixel-data flag fallback"));
+
             // PSD layers are stored backwards (with End Groups before Start Groups), so we must reverse them
             flatLayers.Reverse();
 
@@ -2668,7 +2673,7 @@
 
             foreach (Layer layer in flatLayers)
             {
-                if (IsEndGroup(layer))
+                if (IsEndGroup(layer, useSectionDividerInfo))
                 {
                     if (previousLayers.Count > 0)
                     {
@@ -2682,7 +2687,7 @@
                         currentGroupLayer = null;
                     }
                 }
-                else if (IsStartGroup(layer))
+                else if (IsStartGroup(layer, useSectionDividerInfo))
                 {
                     // push the current layer
                     if (currentGroupLayer != null)
@@ -2736,9 +2741,16 @@
         /// Returns true if the given <see cref="Layer"/> is marking the start of a layer group.
         /// </summary>
         /// <param name="layer">The <see cref="Layer"/> to check if it's the start of a group</param>
+        /// <param name="useSectionDividerInfo">是否使用 PSD 标准分段信息。</param>
         /// <returns>True if the layer starts a group, otherwise false.</returns>
-        private static bool IsStartGroup(Layer layer)
+        private static bool IsStartGroup(Layer layer, bool useSectionDividerInfo)
         {
+            if (useSectionDividerInfo)
+            {
+                return layer.SectionType == LayerSectionType.OpenFolder ||
+                    layer.SectionType == LayerSectionType.ClosedFolder;
+            }
+
             return layer.IsPixelDataIrrelevant;
         }
 
@@ -2746,9 +2758,15 @@
         /// Returns true if the given <see cref="Layer"/> is marking the end of a layer group.
         /// </summary>
         /// <param name="layer">The <see cref="Layer"/> to check if it's the end of a group.</param>
+        /// <param name="useSectionDividerInfo">是否使用 PSD 标准分段信息。</param>
         /// <returns>True if the layer ends a group, otherwise false.</returns>
-        private static bool IsEndGroup(Layer layer)
+        private static bool IsEndGroup(Layer layer, bool useSectionDividerInfo)
         {
+            if (useSectionDividerInfo)
+            {
+                return layer.SectionType == LayerSectionType.BoundingSectionDivider;
+            }
+
             return layer.Name.Contains("</Layer set>") ||
                 layer.Name.Contains("</Layer group>") ||
                 (layer.Name == " copy" && layer.Rect.height == 0);

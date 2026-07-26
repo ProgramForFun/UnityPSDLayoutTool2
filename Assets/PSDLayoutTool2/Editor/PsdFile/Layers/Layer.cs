@@ -6,6 +6,32 @@
     using UnityEngine;
 
     /// <summary>
+    /// PSD 图层分段类型。
+    /// </summary>
+    public enum LayerSectionType
+    {
+        /// <summary>
+        /// 普通图层或未声明分段信息。
+        /// </summary>
+        Other = 0,
+
+        /// <summary>
+        /// 展开的图层组起点。
+        /// </summary>
+        OpenFolder = 1,
+
+        /// <summary>
+        /// 折叠的图层组起点。
+        /// </summary>
+        ClosedFolder = 2,
+
+        /// <summary>
+        /// 图层组结束标记。
+        /// </summary>
+        BoundingSectionDivider = 3
+    }
+
+    /// <summary>
     /// Contains the data representation of a PSD layer
     /// </summary>
     public class Layer
@@ -130,6 +156,10 @@
                     dataReader.ReadByte();
                     Name = dataReader.ReadString().TrimEnd(new char[1]);
                 }
+                else if (adjustmentLayerInfo.Key == "lsct" || adjustmentLayerInfo.Key == "lsdk")
+                {
+                    ReadLayerSectionType(adjustmentLayerInfo.DataReader);
+                }
             }
 
             reader.BaseStream.Position = num4;
@@ -230,6 +260,16 @@
         }
 
         /// <summary>
+        /// 获取此图层是否包含 PSD 标准分段信息。
+        /// </summary>
+        public bool HasSectionDividerInfo { get; private set; }
+
+        /// <summary>
+        /// 获取 PSD 标准分段类型。
+        /// </summary>
+        public LayerSectionType SectionType { get; private set; }
+
+        /// <summary>
         /// Gets or sets the name of the layer.
         /// </summary>
         public string Name { get; set; }
@@ -316,6 +356,21 @@
                 string str = WarpStyle + dataReader.ReadChar();
                 WarpStyle = str;
             }
+        }
+
+        /// <summary>
+        /// 读取 PSD 标准图层分段类型。
+        /// </summary>
+        /// <param name="dataReader">lsct 或 lsdk 附加图层信息的读取器。</param>
+        private void ReadLayerSectionType(BinaryReverseReader dataReader)
+        {
+            if (dataReader == null || dataReader.BaseStream.Length < sizeof(int))
+            {
+                return;
+            }
+
+            SectionType = (LayerSectionType)dataReader.ReadInt32();
+            HasSectionDividerInfo = true;
         }
     }
 }
