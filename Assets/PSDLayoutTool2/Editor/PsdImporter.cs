@@ -51,9 +51,14 @@
         }
 
         /// <summary>
-        /// The current file path to use to save layers as .png files
+        /// The current output path used by animation assets.
         /// </summary>
         private static string currentPath;
+
+        /// <summary>
+        /// The shared output root used by every generated texture.
+        /// </summary>
+        private static string textureOutputRootPath;
 
         /// <summary>
         /// The <see cref="GameObject"/> representing the root PSD layer.  It contains all of the other layers as children GameObjects.
@@ -254,7 +259,7 @@
             public string UniqueSelfName { get; set; }
 
             /// <summary>
-            /// Gets or sets the unique stable texture/file base name in the current output directory.
+            /// Gets or sets the unique stable texture/file base name in the shared output directory.
             /// </summary>
             public string UniqueTextureName { get; set; }
 
@@ -578,6 +583,7 @@
                 }
 
                 currentPath = outputFullPath;
+                textureOutputRootPath = outputFullPath;
                 PsdLogger.Step("Create output directory: " + currentPath);
                 Directory.CreateDirectory(currentPath);
 
@@ -957,7 +963,7 @@
             {
                 for (int i = tree.Count - 1; i >= 0; i--)
                 {
-                    CollectExpectedGeneratedAssetPathsForLayer(tree[i], outputFullPath, expectedPaths);
+                    CollectExpectedGeneratedAssetPathsForLayer(tree[i], outputFullPath, outputFullPath, expectedPaths);
                 }
             }
 
@@ -973,9 +979,14 @@
         /// Recursively collects generated asset paths for one layer.
         /// </summary>
         /// <param name="layer">Layer to inspect.</param>
-        /// <param name="currentDirectory">Current output directory for this layer.</param>
+        /// <param name="currentDirectory">Current directory for non-texture generated assets.</param>
+        /// <param name="textureDirectory">Shared output directory for all textures.</param>
         /// <param name="result">Destination set for generated assets.</param>
-        private static void CollectExpectedGeneratedAssetPathsForLayer(Layer layer, string currentDirectory, HashSet<string> result)
+        private static void CollectExpectedGeneratedAssetPathsForLayer(
+            Layer layer,
+            string currentDirectory,
+            string textureDirectory,
+            HashSet<string> result)
         {
             LayerImportInfo info = GetLayerInfo(layer);
             if (info == null)
@@ -985,16 +996,20 @@
 
             if (info.IsButtonGroup)
             {
-                CollectExpectedGeneratedAssetPathsForButtonGroup(layer, currentDirectory, result);
+                CollectExpectedGeneratedAssetPathsForButtonGroup(layer, textureDirectory, result);
                 return;
             }
 
-            if (DoesLayerCreateOutputDirectory(info))
+            if (ShouldRecurseIntoLayerChildren(info))
             {
                 string childDirectory = Path.Combine(currentDirectory, GetOutputFolderName(layer));
                 for (int i = layer.Children.Count - 1; i >= 0; i--)
                 {
-                    CollectExpectedGeneratedAssetPathsForLayer(layer.Children[i], childDirectory, result);
+                    CollectExpectedGeneratedAssetPathsForLayer(
+                        layer.Children[i],
+                        childDirectory,
+                        textureDirectory,
+                        result);
                 }
 
                 if ((LayoutInScene || CreatePrefab) &&
@@ -1013,7 +1028,7 @@
 
             if (ShouldLayerEmitTextureFile(info))
             {
-                string texturePath = Path.Combine(currentDirectory, GetTextureBaseName(layer) + ".png");
+                string texturePath = Path.Combine(textureDirectory, GetTextureBaseName(layer) + ".png");
                 result.Add(NormalizePath(texturePath));
             }
         }
@@ -1022,11 +1037,11 @@
         /// Collects generated asset paths produced by a button group.
         /// </summary>
         /// <param name="layer">Button group layer.</param>
-        /// <param name="currentDirectory">Current output directory.</param>
+        /// <param name="outputDirectory">Shared output directory.</param>
         /// <param name="result">Destination set for generated assets.</param>
         private static void CollectExpectedGeneratedAssetPathsForButtonGroup(
             Layer layer,
-            string currentDirectory,
+            string outputDirectory,
             HashSet<string> result)
         {
             foreach (Layer child in layer.Children)
@@ -1037,7 +1052,7 @@
                     continue;
                 }
 
-                string path = Path.Combine(currentDirectory, GetTextureBaseName(child) + ".png");
+                string path = Path.Combine(outputDirectory, GetTextureBaseName(child) + ".png");
                 result.Add(NormalizePath(path));
             }
         }
@@ -1248,7 +1263,7 @@
             }
 
             AssignUniqueSelfNamesRecursively(tree, infoMap);
-            AssignUniqueTextureNamesForScope(tree, infoMap);
+            AssignUniqueTextureNames(tree, infoMap);
             return infoMap;
         }
 
@@ -1397,50 +1412,43 @@
         }
 
         /// <summary>
-        /// Assigns unique texture/file names inside one output directory scope.
+        /// Assigns unique texture/file names across the complete PSD layer tree.
         /// </summary>
-        /// <param name="siblings">Sibling layers that share one output directory scope.</param>
+        /// <param name="tree">Top-level PSD layer tree.</param>
         /// <param name="infoMap">Layer metadata map.</param>
-        private static void AssignUniqueTextureNamesForScope(List<Layer> siblings, Dictionary<Layer, LayerImportInfo> infoMap)
+        private static void AssignUniqueTextureNames(List<Layer> tree, Dictionary<Layer, LayerImportInfo> infoMap)
         {
-            if (siblings == null || siblings.Count == 0)
+            if (tree == null || tree.Count == 0)
             {
                 return;
             }
 
-            List<LayerImportInfo> fileEmitters = CollectFileEmittersForScope(siblings, infoMap);
+            List<LayerImportInfo> fileEmitters = new List<LayerImportInfo>();
+            CollectTextureFileEmitters(tree, infoMap, fileEmitters);
             AssignUniqueNames(
                 fileEmitters,
                 GetPreferredTextureBaseName,
                 (info, uniqueName) => info.UniqueTextureName = uniqueName,
                 "Layer");
-
-            foreach (Layer sibling in siblings)
-            {
-                LayerImportInfo info = infoMap[sibling];
-                if (DoesLayerCreateOutputDirectory(info))
-                {
-                    AssignUniqueTextureNamesForScope(sibling.Children, infoMap);
-                }
-            }
         }
 
         /// <summary>
-        /// Collects all layers that export texture files in the current output directory.
+        /// Collects every layer that exports a texture into the shared output directory.
         /// </summary>
-        /// <param name="siblings">Sibling layers in the current scope.</param>
+        /// <param name="layers">Layers in the current tree branch.</param>
         /// <param name="infoMap">Layer metadata map.</param>
-        /// <returns>Ordered file emitters for the current directory.</returns>
-        private static List<LayerImportInfo> CollectFileEmittersForScope(List<Layer> siblings, Dictionary<Layer, LayerImportInfo> infoMap)
+        /// <param name="emitters">Ordered destination list.</param>
+        private static void CollectTextureFileEmitters(
+            List<Layer> layers,
+            Dictionary<Layer, LayerImportInfo> infoMap,
+            List<LayerImportInfo> emitters)
         {
-            List<LayerImportInfo> emitters = new List<LayerImportInfo>();
-
-            foreach (Layer sibling in siblings)
+            foreach (Layer layer in layers)
             {
-                LayerImportInfo info = infoMap[sibling];
+                LayerImportInfo info = infoMap[layer];
                 if (info.IsButtonGroup)
                 {
-                    foreach (Layer child in sibling.Children)
+                    foreach (Layer child in layer.Children)
                     {
                         LayerImportInfo childInfo = infoMap[child];
                         if (ShouldButtonGroupChildEmitTexture(childInfo))
@@ -1452,13 +1460,17 @@
                     continue;
                 }
 
+                if (info.IsFolderLike)
+                {
+                    CollectTextureFileEmitters(layer.Children, infoMap, emitters);
+                    continue;
+                }
+
                 if (!info.IsFolderLike && ShouldLayerEmitTextureFile(info))
                 {
                     emitters.Add(info);
                 }
             }
-
-            return emitters;
         }
 
         /// <summary>
@@ -1475,17 +1487,36 @@
             Action<T, string> assign,
             string fallbackBaseName)
         {
-            Dictionary<string, int> counts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            Dictionary<string, int> nextSuffixes = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            HashSet<string> usedNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
             foreach (T item in items)
             {
                 string baseName = SanitizeStableName(baseNameSelector(item), fallbackBaseName);
-                int currentCount;
-                counts.TryGetValue(baseName, out currentCount);
-                currentCount++;
-                counts[baseName] = currentCount;
+                string uniqueName = baseName;
+                if (!usedNames.Add(uniqueName))
+                {
+                    int suffix;
+                    if (!nextSuffixes.TryGetValue(baseName, out suffix))
+                    {
+                        suffix = 2;
+                    }
 
-                assign(item, currentCount == 1 ? baseName : string.Format("{0}_{1}", baseName, currentCount));
+                    do
+                    {
+                        uniqueName = string.Format("{0}_{1}", baseName, suffix);
+                        suffix++;
+                    }
+                    while (!usedNames.Add(uniqueName));
+
+                    nextSuffixes[baseName] = suffix;
+                }
+                else
+                {
+                    nextSuffixes[baseName] = 2;
+                }
+
+                assign(item, uniqueName);
             }
         }
 
@@ -1876,11 +1907,11 @@
         }
 
         /// <summary>
-        /// Returns true if the layer creates a dedicated output subdirectory.
+        /// Returns true if generated assets should be collected recursively from this folder layer.
         /// </summary>
         /// <param name="info">Layer metadata.</param>
-        /// <returns>True if the layer writes into a dedicated subdirectory.</returns>
-        private static bool DoesLayerCreateOutputDirectory(LayerImportInfo info)
+        /// <returns>True if the layer's children should be processed recursively.</returns>
+        private static bool ShouldRecurseIntoLayerChildren(LayerImportInfo info)
         {
             return info != null && info.IsFolderLike && !info.IsButtonGroup;
         }
@@ -2918,8 +2949,11 @@
                     visibleFrames.Count > 0;
 
                 currentPath = Path.Combine(currentPath, GetOutputFolderName(layer));
-                PsdLogger.Info("Create animation output directory: " + currentPath);
-                Directory.CreateDirectory(currentPath);
+                if (createRuntimeAnimation)
+                {
+                    PsdLogger.Info("Create animation output directory: " + currentPath);
+                    Directory.CreateDirectory(currentPath);
+                }
 
                 if (createRuntimeAnimation)
                 {
@@ -2948,8 +2982,6 @@
             UiLayoutContext oldLayoutContext = currentGroupLayoutContext;
 
             currentPath = Path.Combine(currentPath, GetOutputFolderName(layer));
-            PsdLogger.Info("Create folder output directory: " + currentPath);
-            Directory.CreateDirectory(currentPath);
 
             bool createGroupObject =
                 (LayoutInScene || CreatePrefab) &&
@@ -3112,19 +3144,13 @@
                 return;
             }
 
-            if (DoesLayerCreateOutputDirectory(info))
+            if (ShouldRecurseIntoLayerChildren(info))
             {
-                string oldPath = currentPath;
-                currentPath = Path.Combine(currentPath, GetOutputFolderName(layer));
-                PsdLogger.Info("Create texture-only output directory: " + currentPath);
-                Directory.CreateDirectory(currentPath);
-
                 foreach (Layer child in layer.Children)
                 {
                     ExportLayerTexturesOnly(child);
                 }
 
-                currentPath = oldPath;
                 return;
             }
 
@@ -3145,7 +3171,7 @@
 
             if (layer.Children.Count == 0 && layer.Rect.width > 0 && layer.Rect.height > 0 && (!layer.IsTextLayer || allowTextLayer))
             {
-                file = Path.Combine(currentPath, GetTextureBaseName(layer) + ".png");
+                file = Path.Combine(textureOutputRootPath, GetTextureBaseName(layer) + ".png");
                 if (!ShouldOverwriteExistingGeneratedFile(file))
                 {
                     PsdLogger.Info("Skip PNG write by overwrite selection: " + file + " | " + DescribeLayerForLog(layer));
