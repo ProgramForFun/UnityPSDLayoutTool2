@@ -2,7 +2,9 @@
 {
     using System.Collections.Generic;
     using System.Collections.Specialized;
+    using System.Globalization;
     using System.IO;
+    using System.Text;
     using UnityEngine;
 
     /// <summary>
@@ -303,59 +305,427 @@
         private void ReadTextLayer(BinaryReverseReader dataReader)
         {
             IsTextLayer = true;
-
-            // read the text layer's text string
-            dataReader.Seek("/Text");
-            dataReader.ReadBytes(4);
-            Text = dataReader.ReadString();
-
-            // read the text justification
-            dataReader.Seek("/Justification ");
-            int justification = dataReader.ReadByte() - 48;
+            Text = Name ?? string.Empty;
             Justification = TextJustification.Left;
-            if (justification == 1)
-            {
-                Justification = TextJustification.Right;
-            }
-            else if (justification == 2)
-            {
-                Justification = TextJustification.Center;
-            }
-
-            // read the font size
-            dataReader.Seek("/FontSize ");
-            FontSize = dataReader.ReadFloat();
-
-            // read the font fill color
-            dataReader.Seek("/FillColor");
-            dataReader.Seek("/Values [ ");
-            float alpha = dataReader.ReadFloat();
-            dataReader.ReadByte();
-            float red = dataReader.ReadFloat();
-            dataReader.ReadByte();
-            float green = dataReader.ReadFloat();
-            dataReader.ReadByte();
-            float blue = dataReader.ReadFloat();
-            FillColor = new Color(red * byte.MaxValue, green * byte.MaxValue, blue * byte.MaxValue, alpha * byte.MaxValue);
-
-            // read the font name
-            dataReader.Seek("/FontSet ");
-            dataReader.Seek("/Name");
-            dataReader.ReadBytes(4);
-            FontName = dataReader.ReadString();
-
-            // read the warp style
-            dataReader.Seek("warpStyle");
-            dataReader.Seek("warpStyle");
-            dataReader.ReadBytes(3);
-            int num13 = dataReader.ReadByte();
+            FontSize = Rect.height > 0 ? Rect.height : 16f;
+            FillColor = Color.white;
+            FontName = string.Empty;
             WarpStyle = string.Empty;
 
-            for (; num13 > 0; --num13)
+            if (dataReader == null || dataReader.BaseStream.Length <= 0 || dataReader.BaseStream.Length > int.MaxValue)
             {
-                string str = WarpStyle + dataReader.ReadChar();
-                WarpStyle = str;
+                return;
             }
+
+            dataReader.BaseStream.Position = 0;
+            byte[] data = dataReader.ReadBytes((int)dataReader.BaseStream.Length);
+
+            string text;
+            int ignoredEndIndex;
+            if (TryReadDescriptorUnicodeString(data, "Txt TEXT", out text) ||
+                TryReadEngineDataString(data, "/Text (", 0, true, out text, out ignoredEndIndex))
+            {
+                Text = text;
+            }
+
+            int justification;
+            if (TryReadAsciiInt(data, "/Justification ", 0, out justification))
+            {
+                if (justification == 1)
+                {
+                    Justification = TextJustification.Right;
+                }
+                else if (justification == 2)
+                {
+                    Justification = TextJustification.Center;
+                }
+            }
+
+            float fontSize;
+            if (TryReadAsciiFloat(data, "/FontSize ", 0, out fontSize) && fontSize > 0f)
+            {
+                FontSize = fontSize;
+            }
+
+            Color fillColor;
+            if (TryReadFillColor(data, out fillColor))
+            {
+                FillColor = fillColor;
+            }
+
+            string fontName;
+            if (TryReadFontName(data, out fontName))
+            {
+                FontName = fontName;
+            }
+
+            string warpStyle;
+            if (TryReadWarpStyle(data, out warpStyle))
+            {
+                WarpStyle = warpStyle;
+            }
+        }
+
+        /// <summary>
+        /// Reads the standard Unicode text value stored in the TySh action descriptor.
+        /// </summary>
+        private static bool TryReadDescriptorUnicodeString(byte[] data, string marker, out string value)
+        {
+            value = string.Empty;
+            int markerIndex = FindAsciiToken(data, marker, 0);
+            if (markerIndex < 0)
+            {
+                return false;
+            }
+
+            int lengthIndex = markerIndex + marker.Length;
+            int characterCount;
+            if (!TryReadInt32BigEndian(data, lengthIndex, out characterCount) || characterCount < 0)
+            {
+                return false;
+            }
+
+            int textIndex = lengthIndex + sizeof(int);
+            long byteCount = (long)characterCount * 2L;
+            if (byteCount > int.MaxValue || textIndex + byteCount > data.Length)
+            {
+                return false;
+            }
+
+            value = Encoding.BigEndianUnicode.GetString(data, textIndex, (int)byteCount).TrimEnd('\0');
+            return true;
+        }
+
+        /// <summary>
+        /// Reads a Photoshop EngineData literal string such as /Text (...).
+        /// </summary>
+        private static bool TryReadEngineDataString(
+            byte[] data,
+            string marker,
+            int startIndex,
+            bool trimTrailingCarriageReturn,
+            out string value,
+            out int endIndex)
+        {
+            value = string.Empty;
+            endIndex = startIndex;
+
+            int markerIndex = FindAsciiToken(data, marker, startIndex);
+            if (markerIndex < 0)
+            {
+                return false;
+            }
+
+            int valueIndex = markerIndex + marker.Length;
+            if (valueIndex + 1 < data.Length && data[valueIndex] == 0xFE && data[valueIndex + 1] == 0xFF)
+            {
+                return TryReadUtf16EngineDataString(data, valueIndex + 2, true, trimTrailingCarriageReturn, out value, out endIndex);
+            }
+
+            if (valueIndex + 1 < data.Length && data[valueIndex] == 0xFF && data[valueIndex + 1] == 0xFE)
+            {
+                return TryReadUtf16EngineDataString(data, valueIndex + 2, false, trimTrailingCarriageReturn, out value, out endIndex);
+            }
+
+            StringBuilder builder = new StringBuilder();
+            bool escaped = false;
+            for (int index = valueIndex; index < data.Length; ++index)
+            {
+                byte current = data[index];
+                if (!escaped && current == (byte)')')
+                {
+                    value = builder.ToString();
+                    endIndex = index + 1;
+                    return true;
+                }
+
+                if (!escaped && current == (byte)'\\')
+                {
+                    escaped = true;
+                    continue;
+                }
+
+                builder.Append((char)current);
+                escaped = false;
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Reads a BOM-prefixed UTF-16 EngineData string up to its ASCII closing parenthesis.
+        /// </summary>
+        private static bool TryReadUtf16EngineDataString(
+            byte[] data,
+            int valueIndex,
+            bool bigEndian,
+            bool trimTrailingCarriageReturn,
+            out string value,
+            out int endIndex)
+        {
+            StringBuilder builder = new StringBuilder();
+            for (int index = valueIndex; index < data.Length; index += 2)
+            {
+                if (data[index] == (byte)')')
+                {
+                    value = builder.ToString();
+                    if (trimTrailingCarriageReturn && value.EndsWith("\r"))
+                    {
+                        value = value.Substring(0, value.Length - 1);
+                    }
+
+                    endIndex = index + 1;
+                    return true;
+                }
+
+                if (index + 1 >= data.Length)
+                {
+                    break;
+                }
+
+                ushort codeUnit = bigEndian
+                    ? (ushort)((data[index] << 8) | data[index + 1])
+                    : (ushort)(data[index] | (data[index + 1] << 8));
+                builder.Append((char)codeUnit);
+            }
+
+            value = string.Empty;
+            endIndex = valueIndex;
+            return false;
+        }
+
+        /// <summary>
+        /// Reads the first fill color array following /FillColor.
+        /// </summary>
+        private static bool TryReadFillColor(byte[] data, out Color color)
+        {
+            color = Color.white;
+            int fillColorIndex = FindAsciiToken(data, "/FillColor", 0);
+            int valuesIndex = FindAsciiToken(data, "/Values [", fillColorIndex >= 0 ? fillColorIndex : 0);
+            if (fillColorIndex < 0 || valuesIndex < 0)
+            {
+                return false;
+            }
+
+            int valueIndex = valuesIndex + "/Values [".Length;
+            float alpha;
+            float red;
+            float green;
+            float blue;
+            if (!TryReadNextAsciiFloat(data, ref valueIndex, out alpha) ||
+                !TryReadNextAsciiFloat(data, ref valueIndex, out red) ||
+                !TryReadNextAsciiFloat(data, ref valueIndex, out green) ||
+                !TryReadNextAsciiFloat(data, ref valueIndex, out blue))
+            {
+                return false;
+            }
+
+            color = new Color(red, green, blue, alpha);
+            return true;
+        }
+
+        /// <summary>
+        /// Resolves the font selected by the first style run against the EngineData font set.
+        /// </summary>
+        private static bool TryReadFontName(byte[] data, out string fontName)
+        {
+            fontName = string.Empty;
+            int fontSetIndex = FindAsciiToken(data, "/FontSet [", 0);
+            if (fontSetIndex < 0)
+            {
+                return false;
+            }
+
+            int selectedFontIndex = 0;
+            TryReadAsciiInt(data, "/Font ", 0, out selectedFontIndex);
+            selectedFontIndex = selectedFontIndex < 0 ? 0 : selectedFontIndex;
+
+            int searchIndex = fontSetIndex + "/FontSet [".Length;
+            string firstFontName = string.Empty;
+            for (int index = 0; index <= selectedFontIndex; ++index)
+            {
+                string currentFontName;
+                int endIndex;
+                if (!TryReadEngineDataString(data, "/Name (", searchIndex, false, out currentFontName, out endIndex))
+                {
+                    break;
+                }
+
+                if (index == 0)
+                {
+                    firstFontName = currentFontName;
+                }
+
+                if (index == selectedFontIndex)
+                {
+                    fontName = currentFontName;
+                    return !string.IsNullOrEmpty(fontName);
+                }
+
+                searchIndex = endIndex;
+            }
+
+            fontName = firstFontName;
+            return !string.IsNullOrEmpty(fontName);
+        }
+
+        /// <summary>
+        /// Reads the warp enum value from the binary TySh descriptor when present.
+        /// </summary>
+        private static bool TryReadWarpStyle(byte[] data, out string warpStyle)
+        {
+            warpStyle = string.Empty;
+            int firstIndex = FindAsciiToken(data, "warpStyle", 0);
+            int secondIndex = FindAsciiToken(data, "warpStyle", firstIndex >= 0 ? firstIndex + "warpStyle".Length : 0);
+            if (firstIndex < 0 || secondIndex < 0)
+            {
+                return false;
+            }
+
+            int lengthIndex = secondIndex + "warpStyle".Length;
+            int length;
+            if (!TryReadInt32BigEndian(data, lengthIndex, out length) || length <= 0)
+            {
+                return false;
+            }
+
+            int valueIndex = lengthIndex + sizeof(int);
+            if (valueIndex + length > data.Length)
+            {
+                return false;
+            }
+
+            warpStyle = Encoding.ASCII.GetString(data, valueIndex, length);
+            return true;
+        }
+
+        /// <summary>
+        /// Reads an ASCII integer following the given marker.
+        /// </summary>
+        private static bool TryReadAsciiInt(byte[] data, string marker, int startIndex, out int value)
+        {
+            value = 0;
+            float floatValue;
+            if (!TryReadAsciiFloat(data, marker, startIndex, out floatValue))
+            {
+                return false;
+            }
+
+            value = (int)floatValue;
+            return true;
+        }
+
+        /// <summary>
+        /// Reads an ASCII float following the given marker.
+        /// </summary>
+        private static bool TryReadAsciiFloat(byte[] data, string marker, int startIndex, out float value)
+        {
+            value = 0f;
+            int markerIndex = FindAsciiToken(data, marker, startIndex);
+            if (markerIndex < 0)
+            {
+                return false;
+            }
+
+            int valueIndex = markerIndex + marker.Length;
+            return TryReadNextAsciiFloat(data, ref valueIndex, out value);
+        }
+
+        /// <summary>
+        /// Reads the next whitespace-delimited ASCII float from a byte array.
+        /// </summary>
+        private static bool TryReadNextAsciiFloat(byte[] data, ref int index, out float value)
+        {
+            value = 0f;
+            while (index < data.Length && IsAsciiWhitespace(data[index]))
+            {
+                ++index;
+            }
+
+            int startIndex = index;
+            while (index < data.Length && IsAsciiNumberCharacter(data[index]))
+            {
+                ++index;
+            }
+
+            if (startIndex == index)
+            {
+                return false;
+            }
+
+            string number = Encoding.ASCII.GetString(data, startIndex, index - startIndex);
+            return float.TryParse(number, NumberStyles.Float, CultureInfo.InvariantCulture, out value);
+        }
+
+        /// <summary>
+        /// Finds an ASCII marker without moving a stream or reading beyond its bounds.
+        /// </summary>
+        private static int FindAsciiToken(byte[] data, string marker, int startIndex)
+        {
+            if (data == null || string.IsNullOrEmpty(marker) || startIndex < 0)
+            {
+                return -1;
+            }
+
+            int lastStartIndex = data.Length - marker.Length;
+            for (int index = startIndex; index <= lastStartIndex; ++index)
+            {
+                bool matches = true;
+                for (int markerIndex = 0; markerIndex < marker.Length; ++markerIndex)
+                {
+                    if (data[index + markerIndex] != (byte)marker[markerIndex])
+                    {
+                        matches = false;
+                        break;
+                    }
+                }
+
+                if (matches)
+                {
+                    return index;
+                }
+            }
+
+            return -1;
+        }
+
+        /// <summary>
+        /// Reads a signed big-endian Int32 without throwing on truncated data.
+        /// </summary>
+        private static bool TryReadInt32BigEndian(byte[] data, int index, out int value)
+        {
+            value = 0;
+            if (data == null || index < 0 || index > data.Length - sizeof(int))
+            {
+                return false;
+            }
+
+            value = (data[index] << 24) |
+                (data[index + 1] << 16) |
+                (data[index + 2] << 8) |
+                data[index + 3];
+            return true;
+        }
+
+        /// <summary>
+        /// Returns whether a byte is whitespace in EngineData.
+        /// </summary>
+        private static bool IsAsciiWhitespace(byte value)
+        {
+            return value == (byte)' ' || value == (byte)'\t' || value == (byte)'\r' || value == (byte)'\n';
+        }
+
+        /// <summary>
+        /// Returns whether a byte can occur in an EngineData number.
+        /// </summary>
+        private static bool IsAsciiNumberCharacter(byte value)
+        {
+            return (value >= (byte)'0' && value <= (byte)'9') ||
+                value == (byte)'+' ||
+                value == (byte)'-' ||
+                value == (byte)'.' ||
+                value == (byte)'e' ||
+                value == (byte)'E';
         }
 
         /// <summary>
