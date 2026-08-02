@@ -5,7 +5,6 @@
     using System.IO;
     using System.Linq;
     using System.Text;
-    using System.Text.RegularExpressions;
     using PhotoshopFile;
     using UnityEditor;
     using UnityEditorInternal;
@@ -151,143 +150,6 @@
             "LPT8",
             "LPT9"
         };
-
-        /// <summary>
-        /// Represents how a button-group child should be interpreted.
-        /// </summary>
-        private enum ButtonChildRole
-        {
-            None,
-            Default,
-            Pressed,
-            Highlighted,
-            Disabled,
-            TextImage
-        }
-
-        /// <summary>
-        /// Supported anchor presets parsed from layer or folder names.
-        /// </summary>
-        private enum AnchorNamePreset
-        {
-            None,
-            Global,
-            TopLeft,
-            BottomLeft,
-            TopRight,
-            BottomRight,
-            Center,
-            LeftMiddle,
-            RightMiddle,
-            TopMiddle,
-            BottomMiddle
-        }
-
-        /// <summary>
-        /// Describes how one parent RectTransform maps PSD space into its local space.
-        /// </summary>
-        private struct UiLayoutContext
-        {
-            /// <summary>
-            /// Gets or sets the PSD-space rectangle represented by this layout context.
-            /// </summary>
-            public Rect PsdReferenceRect { get; set; }
-
-            /// <summary>
-            /// Gets or sets the full local rect size of the current parent RectTransform.
-            /// </summary>
-            public Vector2 LocalRectSize { get; set; }
-
-            /// <summary>
-            /// Gets or sets the PSD content display rect within the parent local space.
-            /// </summary>
-            public Rect LocalDisplayRect { get; set; }
-        }
-
-        /// <summary>
-        /// Stores resolved import metadata for one PSD layer.
-        /// </summary>
-        private sealed class LayerImportInfo
-        {
-            /// <summary>
-            /// Initializes a new instance of the <see cref="LayerImportInfo"/> class.
-            /// </summary>
-            /// <param name="layer">PSD layer.</param>
-            public LayerImportInfo(Layer layer)
-            {
-                Layer = layer;
-            }
-
-            /// <summary>
-            /// Gets the source PSD layer.
-            /// </summary>
-            public Layer Layer { get; private set; }
-
-            /// <summary>
-            /// Gets or sets the resolved parent info.
-            /// </summary>
-            public LayerImportInfo Parent { get; set; }
-
-            /// <summary>
-            /// Gets or sets a value indicating whether this layer is visible after inheriting parent visibility.
-            /// </summary>
-            public bool EffectiveVisible { get; set; }
-
-            /// <summary>
-            /// Gets or sets a value indicating whether this layer behaves like a folder/group.
-            /// </summary>
-            public bool IsFolderLike { get; set; }
-
-            /// <summary>
-            /// Gets or sets a value indicating whether this layer is a |Button group.
-            /// </summary>
-            public bool IsButtonGroup { get; set; }
-
-            /// <summary>
-            /// Gets or sets a value indicating whether this layer is a |Animation group.
-            /// </summary>
-            public bool IsAnimationGroup { get; set; }
-
-            /// <summary>
-            /// Gets or sets the parsed button-child role when parent is a button group.
-            /// </summary>
-            public ButtonChildRole ButtonRole { get; set; }
-
-            /// <summary>
-            /// Gets or sets the unique stable name for this layer among siblings.
-            /// </summary>
-            public string UniqueSelfName { get; set; }
-
-            /// <summary>
-            /// Gets or sets the unique stable texture/file base name in the shared output directory.
-            /// </summary>
-            public string UniqueTextureName { get; set; }
-
-            /// <summary>
-            /// Gets or sets the parsed animation frame rate.
-            /// </summary>
-            public float AnimationFps { get; set; }
-
-            /// <summary>
-            /// Gets or sets the parsed anchor preset from the source layer name.
-            /// </summary>
-            public AnchorNamePreset AnchorPreset { get; set; }
-
-            /// <summary>
-            /// Gets or sets the explicitly parsed anchor preset from the source layer name before inheritance.
-            /// </summary>
-            public AnchorNamePreset ExplicitAnchorPreset { get; set; }
-
-            /// <summary>
-            /// Gets or sets the resolved layout rect used for UI placement.
-            /// </summary>
-            public Rect LayoutRect { get; set; }
-
-            /// <summary>
-            /// Gets or sets a value indicating whether <see cref="LayoutRect"/> contains a usable rect.
-            /// </summary>
-            public bool HasLayoutRect { get; set; }
-        }
 
         /// <summary>
         /// Initializes static members of the <see cref="PsdImporter"/> class.
@@ -1251,139 +1113,11 @@
         /// <returns>Metadata keyed by PSD layer instance.</returns>
         private static Dictionary<Layer, LayerImportInfo> BuildLayerImportInfoMap(List<Layer> tree)
         {
-            Dictionary<Layer, LayerImportInfo> infoMap = new Dictionary<Layer, LayerImportInfo>();
-            if (tree == null)
-            {
-                return infoMap;
-            }
-
-            foreach (Layer layer in tree)
-            {
-                CreateLayerImportInfo(layer, null, true, infoMap);
-            }
-
+            LayerImportInfoBuilder builder = new LayerImportInfoBuilder(EnableAutoAnchorByName);
+            Dictionary<Layer, LayerImportInfo> infoMap = builder.Build(tree);
             AssignUniqueSelfNamesRecursively(tree, infoMap);
             AssignUniqueTextureNames(tree, infoMap);
             return infoMap;
-        }
-
-        /// <summary>
-        /// Creates import metadata for one layer and its descendants.
-        /// </summary>
-        /// <param name="layer">Layer to inspect.</param>
-        /// <param name="parent">Parent metadata.</param>
-        /// <param name="parentVisible">Inherited parent visibility.</param>
-        /// <param name="infoMap">Destination map.</param>
-        private static void CreateLayerImportInfo(
-            Layer layer,
-            LayerImportInfo parent,
-            bool parentVisible,
-            Dictionary<Layer, LayerImportInfo> infoMap)
-        {
-            LayerImportInfo info = new LayerImportInfo(layer)
-            {
-                Parent = parent,
-                EffectiveVisible = parentVisible && layer.Visible,
-                IsFolderLike = layer.Children.Count > 0 || layer.Rect.width == 0,
-                AnimationFps = GetAnimationFps(layer.Name)
-            };
-
-            info.IsButtonGroup = info.IsFolderLike && layer.Name.ContainsIgnoreCase("|Button");
-            info.IsAnimationGroup = info.IsFolderLike && layer.Name.ContainsIgnoreCase("|Animation");
-            info.ButtonRole = parent != null && parent.IsButtonGroup ? GetButtonChildRole(layer) : ButtonChildRole.None;
-            info.ExplicitAnchorPreset = ParseAnchorPreset(GetAnchorParsingName(info));
-            info.AnchorPreset = ResolveAnchorPreset(info);
-
-            infoMap[layer] = info;
-
-            foreach (Layer child in layer.Children)
-            {
-                CreateLayerImportInfo(child, info, info.EffectiveVisible, infoMap);
-            }
-
-            Rect layoutRect;
-            info.HasLayoutRect = TryResolveLayerLayoutRect(info, infoMap, out layoutRect);
-            info.LayoutRect = layoutRect;
-        }
-
-        /// <summary>
-        /// Resolves the effective layout rect used to place one layer in Unity UI.
-        /// </summary>
-        /// <param name="info">Layer metadata.</param>
-        /// <param name="infoMap">Layer metadata map.</param>
-        /// <param name="layoutRect">Resolved rect when available.</param>
-        /// <returns>True when a valid layout rect exists.</returns>
-        private static bool TryResolveLayerLayoutRect(
-            LayerImportInfo info,
-            Dictionary<Layer, LayerImportInfo> infoMap,
-            out Rect layoutRect)
-        {
-            layoutRect = default(Rect);
-            if (info == null || info.Layer == null)
-            {
-                return false;
-            }
-
-            if (!info.IsFolderLike)
-            {
-                if (info.Layer.Rect.width > 0f && info.Layer.Rect.height > 0f)
-                {
-                    layoutRect = info.Layer.Rect;
-                    return true;
-                }
-
-                return false;
-            }
-
-            bool hasBounds = false;
-            Rect combinedRect = default(Rect);
-            foreach (Layer child in info.Layer.Children)
-            {
-                LayerImportInfo childInfo;
-                if (!infoMap.TryGetValue(child, out childInfo) || childInfo == null || !childInfo.EffectiveVisible || !childInfo.HasLayoutRect)
-                {
-                    continue;
-                }
-
-                if (!hasBounds)
-                {
-                    combinedRect = childInfo.LayoutRect;
-                    hasBounds = true;
-                }
-                else
-                {
-                    combinedRect = CombineRects(combinedRect, childInfo.LayoutRect);
-                }
-            }
-
-            if (hasBounds)
-            {
-                layoutRect = combinedRect;
-                return true;
-            }
-
-            if (info.Layer.Rect.width > 0f && info.Layer.Rect.height > 0f)
-            {
-                layoutRect = info.Layer.Rect;
-                return true;
-            }
-
-            return false;
-        }
-
-        /// <summary>
-        /// Combines two rects into one bounding rect.
-        /// </summary>
-        /// <param name="first">First rect.</param>
-        /// <param name="second">Second rect.</param>
-        /// <returns>Bounding rect containing both inputs.</returns>
-        private static Rect CombineRects(Rect first, Rect second)
-        {
-            float xMin = Mathf.Min(first.xMin, second.xMin);
-            float yMin = Mathf.Min(first.yMin, second.yMin);
-            float xMax = Mathf.Max(first.xMax, second.xMax);
-            float yMax = Mathf.Max(first.yMax, second.yMax);
-            return Rect.MinMaxRect(xMin, yMin, xMax, yMax);
         }
 
         /// <summary>
@@ -1534,17 +1268,17 @@
 
             if (info.IsAnimationGroup)
             {
-                return SanitizeStableName(GetAnimationLayerBaseName(info.Layer.Name), "Animation");
+                return SanitizeStableName(LayerNameResolver.GetAnimationBaseName(info.NameParts), "Animation");
             }
 
             if (info.IsButtonGroup)
             {
-                return SanitizeStableName(RemoveTagIgnoreCase(info.Layer.Name, "|Button"), "Button");
+                return SanitizeStableName(LayerNameResolver.GetButtonGroupBaseName(info.NameParts), "Button");
             }
 
             if (info.Parent != null && info.Parent.IsButtonGroup)
             {
-                return SanitizeStableName(GetButtonChildBaseName(info.Layer), info.Layer.IsTextLayer ? "Text" : "Layer");
+                return SanitizeStableName(LayerNameResolver.GetButtonChildBaseName(info), info.Layer.IsTextLayer ? "Text" : "Layer");
             }
 
             return SanitizeStableName(info.Layer.Name, info.IsFolderLike ? "Folder" : "Layer");
@@ -1570,290 +1304,6 @@
             }
 
             return info.UniqueSelfName ?? GetStableSelfBaseName(info);
-        }
-
-        /// <summary>
-        /// Gets the base name used for animation folders/assets.
-        /// </summary>
-        /// <param name="name">Original layer name.</param>
-        /// <returns>Animation base name.</returns>
-        private static string GetAnimationLayerBaseName(string name)
-        {
-            string strippedName = RemoveAnimationTags(name);
-            string[] nameParts = strippedName.Split(new[] { '|' }, StringSplitOptions.RemoveEmptyEntries);
-            string baseName = nameParts.Length > 0 ? nameParts[0] : strippedName;
-            return string.IsNullOrWhiteSpace(baseName) ? "Animation" : baseName.Trim();
-        }
-
-        /// <summary>
-        /// Removes animation-related tags from a layer name.
-        /// </summary>
-        /// <param name="name">Layer name.</param>
-        /// <returns>Name without animation tags.</returns>
-        private static string RemoveAnimationTags(string name)
-        {
-            string strippedName = RemoveTagIgnoreCase(name, "|Animation");
-            return Regex.Replace(strippedName, "\\|FPS=[^|]+", string.Empty, RegexOptions.IgnoreCase);
-        }
-
-        /// <summary>
-        /// Parses animation FPS from the layer name.
-        /// </summary>
-        /// <param name="name">Layer name.</param>
-        /// <returns>Frame rate, defaulting to 30 when unspecified.</returns>
-        private static float GetAnimationFps(string name)
-        {
-            float fps = 30f;
-            if (string.IsNullOrEmpty(name))
-            {
-                return fps;
-            }
-
-            string[] args = name.Split(new[] { '|' }, StringSplitOptions.RemoveEmptyEntries);
-            foreach (string arg in args)
-            {
-                if (!arg.StartsWith("FPS=", StringComparison.OrdinalIgnoreCase))
-                {
-                    continue;
-                }
-
-                float parsedFps;
-                if (float.TryParse(arg.Substring(4), out parsedFps))
-                {
-                    fps = parsedFps;
-                }
-                else
-                {
-                    Debug.LogError(string.Format("Unable to parse FPS: \"{0}\"", arg));
-                }
-
-                break;
-            }
-
-            return fps;
-        }
-
-        /// <summary>
-        /// Resolves the parsed anchor preset for one layer.
-        /// </summary>
-        /// <param name="info">Layer metadata.</param>
-        /// <returns>Parsed preset or <see cref="AnchorNamePreset.None"/> when no prefix applies.</returns>
-        private static AnchorNamePreset ResolveAnchorPreset(LayerImportInfo info)
-        {
-            if (!EnableAutoAnchorByName || info == null)
-            {
-                return AnchorNamePreset.None;
-            }
-
-            if (info.ExplicitAnchorPreset != AnchorNamePreset.None)
-            {
-                return info.ExplicitAnchorPreset;
-            }
-
-            if (info.Parent != null &&
-                info.Parent.IsFolderLike &&
-                info.Parent.AnchorPreset != AnchorNamePreset.None)
-            {
-                return info.Parent.AnchorPreset;
-            }
-
-            return AnchorNamePreset.None;
-        }
-
-        /// <summary>
-        /// Gets the source name used for anchor-prefix parsing.
-        /// </summary>
-        /// <param name="info">Layer metadata.</param>
-        /// <returns>Name without tool tags.</returns>
-        private static string GetAnchorParsingName(LayerImportInfo info)
-        {
-            if (info == null || info.Layer == null || string.IsNullOrEmpty(info.Layer.Name))
-            {
-                return string.Empty;
-            }
-
-            string name = info.Layer.Name;
-            if (info.IsAnimationGroup)
-            {
-                return GetAnimationLayerBaseName(name);
-            }
-
-            if (info.IsButtonGroup)
-            {
-                return RemoveTagIgnoreCase(name, "|Button");
-            }
-
-            if (info.Parent != null && info.Parent.IsButtonGroup)
-            {
-                return GetButtonChildBaseName(info.Layer);
-            }
-
-            int pipeIndex = name.IndexOf('|');
-            return pipeIndex >= 0 ? name.Substring(0, pipeIndex) : name;
-        }
-
-        /// <summary>
-        /// Parses a layer-name prefix into an anchor preset.
-        /// </summary>
-        /// <param name="name">Layer or folder name without tool tags.</param>
-        /// <returns>Resolved anchor preset.</returns>
-        private static AnchorNamePreset ParseAnchorPreset(string name)
-        {
-            if (string.IsNullOrWhiteSpace(name))
-            {
-                return AnchorNamePreset.None;
-            }
-
-            string trimmedName = name.TrimStart();
-            if (trimmedName.StartsWith("全局", StringComparison.OrdinalIgnoreCase))
-            {
-                return AnchorNamePreset.Global;
-            }
-
-            if (trimmedName.StartsWith("左上", StringComparison.OrdinalIgnoreCase))
-            {
-                return AnchorNamePreset.TopLeft;
-            }
-
-            if (trimmedName.StartsWith("左下", StringComparison.OrdinalIgnoreCase))
-            {
-                return AnchorNamePreset.BottomLeft;
-            }
-
-            if (trimmedName.StartsWith("右上", StringComparison.OrdinalIgnoreCase))
-            {
-                return AnchorNamePreset.TopRight;
-            }
-
-            if (trimmedName.StartsWith("右下", StringComparison.OrdinalIgnoreCase))
-            {
-                return AnchorNamePreset.BottomRight;
-            }
-
-            if (trimmedName.StartsWith("中间", StringComparison.OrdinalIgnoreCase))
-            {
-                return AnchorNamePreset.Center;
-            }
-
-            if (trimmedName.StartsWith("左中", StringComparison.OrdinalIgnoreCase))
-            {
-                return AnchorNamePreset.LeftMiddle;
-            }
-
-            if (trimmedName.StartsWith("右中", StringComparison.OrdinalIgnoreCase))
-            {
-                return AnchorNamePreset.RightMiddle;
-            }
-
-            if (trimmedName.StartsWith("上中", StringComparison.OrdinalIgnoreCase))
-            {
-                return AnchorNamePreset.TopMiddle;
-            }
-
-            if (trimmedName.StartsWith("下中", StringComparison.OrdinalIgnoreCase))
-            {
-                return AnchorNamePreset.BottomMiddle;
-            }
-
-            if (trimmedName.StartsWith("上", StringComparison.OrdinalIgnoreCase))
-            {
-                return AnchorNamePreset.TopMiddle;
-            }
-
-            if (trimmedName.StartsWith("下", StringComparison.OrdinalIgnoreCase))
-            {
-                return AnchorNamePreset.BottomMiddle;
-            }
-
-            if (trimmedName.StartsWith("左", StringComparison.OrdinalIgnoreCase))
-            {
-                return AnchorNamePreset.LeftMiddle;
-            }
-
-            if (trimmedName.StartsWith("右", StringComparison.OrdinalIgnoreCase))
-            {
-                return AnchorNamePreset.RightMiddle;
-            }
-
-            return AnchorNamePreset.None;
-        }
-
-        /// <summary>
-        /// Gets the role of a button child layer.
-        /// </summary>
-        /// <param name="layer">Button child layer.</param>
-        /// <returns>Resolved button role.</returns>
-        private static ButtonChildRole GetButtonChildRole(Layer layer)
-        {
-            if (layer == null)
-            {
-                return ButtonChildRole.None;
-            }
-
-            if (layer.Name.ContainsIgnoreCase("|Disabled"))
-            {
-                return ButtonChildRole.Disabled;
-            }
-
-            if (layer.Name.ContainsIgnoreCase("|Highlighted"))
-            {
-                return ButtonChildRole.Highlighted;
-            }
-
-            if (layer.Name.ContainsIgnoreCase("|Pressed"))
-            {
-                return ButtonChildRole.Pressed;
-            }
-
-            if (layer.Name.ContainsIgnoreCase("|Default") ||
-                layer.Name.ContainsIgnoreCase("|Enabled") ||
-                layer.Name.ContainsIgnoreCase("|Normal") ||
-                layer.Name.ContainsIgnoreCase("|Up"))
-            {
-                return ButtonChildRole.Default;
-            }
-
-            if (layer.Name.ContainsIgnoreCase("|Text") && !layer.IsTextLayer)
-            {
-                return ButtonChildRole.TextImage;
-            }
-
-            return ButtonChildRole.None;
-        }
-
-        /// <summary>
-        /// Gets a button child name with button-state tags removed.
-        /// </summary>
-        /// <param name="layer">Button child layer.</param>
-        /// <returns>Tag-stripped base name.</returns>
-        private static string GetButtonChildBaseName(Layer layer)
-        {
-            string name = layer != null ? layer.Name : string.Empty;
-            name = RemoveTagIgnoreCase(name, "|Disabled");
-            name = RemoveTagIgnoreCase(name, "|Highlighted");
-            name = RemoveTagIgnoreCase(name, "|Pressed");
-            name = RemoveTagIgnoreCase(name, "|Default");
-            name = RemoveTagIgnoreCase(name, "|Enabled");
-            name = RemoveTagIgnoreCase(name, "|Normal");
-            name = RemoveTagIgnoreCase(name, "|Up");
-
-            if (layer != null && !layer.IsTextLayer)
-            {
-                name = RemoveTagIgnoreCase(name, "|Text");
-            }
-
-            return name;
-        }
-
-        /// <summary>
-        /// Removes one tag from a name without case sensitivity.
-        /// </summary>
-        /// <param name="name">Source string.</param>
-        /// <param name="tag">Tag to remove.</param>
-        /// <returns>Updated string.</returns>
-        private static string RemoveTagIgnoreCase(string name, string tag)
-        {
-            return string.IsNullOrEmpty(name) ? string.Empty : name.ReplaceIgnoreCase(tag, string.Empty);
         }
 
         /// <summary>
@@ -3019,45 +2469,6 @@
         }
 
         /// <summary>
-        /// Checks if the string contains the given string, while ignoring any casing.
-        /// </summary>
-        /// <param name="source">The source string to check.</param>
-        /// <param name="toCheck">The string to search for in the source string.</param>
-        /// <returns>True if the string contains the search string, otherwise false.</returns>
-        private static bool ContainsIgnoreCase(this string source, string toCheck)
-        {
-            return source.IndexOf(toCheck, StringComparison.OrdinalIgnoreCase) >= 0;
-        }
-
-        /// <summary>
-        /// Replaces any instance of the given string in this string with the given string.
-        /// </summary>
-        /// <param name="str">The string to replace sections in.</param>
-        /// <param name="oldValue">The string to search for.</param>
-        /// <param name="newValue">The string to replace the search string with.</param>
-        /// <returns>The replaced string.</returns>
-        private static string ReplaceIgnoreCase(this string str, string oldValue, string newValue)
-        {
-            StringBuilder sb = new StringBuilder();
-
-            int previousIndex = 0;
-            int index = str.IndexOf(oldValue, StringComparison.OrdinalIgnoreCase);
-            while (index != -1)
-            {
-                sb.Append(str.Substring(previousIndex, index - previousIndex));
-                sb.Append(newValue);
-                index += oldValue.Length;
-
-                previousIndex = index;
-                index = str.IndexOf(oldValue, index, StringComparison.OrdinalIgnoreCase);
-            }
-
-            sb.Append(str.Substring(previousIndex));
-
-            return sb.ToString();
-        }
-
-        /// <summary>
         /// Exports an art layer as an image file and sprite.  It can also generate text meshes from text layers.
         /// </summary>
         /// <param name="layer">The art layer to export.</param>
@@ -3285,49 +2696,38 @@
         }
 
         /// <summary>
-        /// Resolves a font for text layers, preferring the PSD font and falling back to common CJK fonts.
+        /// Creates a generator context from the current import state.
         /// </summary>
-        /// <param name="layer">The text layer.</param>
-        /// <returns>A usable Unity font.</returns>
-        private static Font GetFontForLayer(Layer layer)
+        /// <returns>Generator context.</returns>
+        private static PsdLayerGenerationContext CreateLayerGenerationContext()
         {
-            List<string> fontCandidates = new List<string>();
-            if (!string.IsNullOrEmpty(layer.FontName))
+            return new PsdLayerGenerationContext
             {
-                fontCandidates.Add(layer.FontName.Trim());
-            }
+                ParentGameObject = currentGroupGameObject,
+                CanvasSize = CanvasSize,
+                PixelsToUnits = PixelsToUnits,
+                CurrentDepth = currentDepth,
+                DepthStep = depthStep,
+                CurrentSortingOrder = currentSortingOrder,
+                UseTargetCanvasCoordinates = UseTargetCanvasCoordinates,
+                TargetCanvasUniformScale = GetTargetCanvasUniformScale(),
+                LayerInfoProvider = GetLayerInfo,
+                RuntimeNameProvider = GetRuntimeObjectName,
+                SpriteProvider = CreateSprite,
+                FontProvider = LayerFontResolver.Resolve,
+                UILayoutApplier = (transform, layer, preset) => ApplyLayerUILayout(transform, layer, preset),
+                GlobalAnchorPredicate = IsGlobalAnchorPreset
+            };
+        }
 
-            fontCandidates.Add("Microsoft YaHei");
-            fontCandidates.Add("SimHei");
-            fontCandidates.Add("SimSun");
-            fontCandidates.Add("PingFang SC");
-            fontCandidates.Add("Heiti SC");
-            fontCandidates.Add("Noto Sans CJK SC");
-            fontCandidates.Add("Arial Unicode MS");
-            fontCandidates.Add("Arial");
-
-            foreach (string fontName in fontCandidates.Distinct(StringComparer.OrdinalIgnoreCase))
-            {
-                if (string.IsNullOrEmpty(fontName))
-                {
-                    continue;
-                }
-
-                try
-                {
-                    Font font = Font.CreateDynamicFontFromOSFont(fontName, 16);
-                    if (font != null)
-                    {
-                        return font;
-                    }
-                }
-                catch
-                {
-                    // Ignore unavailable fonts and try the next candidate.
-                }
-            }
-
-            return Resources.GetBuiltinResource<Font>("Arial.ttf");
+        /// <summary>
+        /// Writes mutable generator state back to the importer.
+        /// </summary>
+        /// <param name="context">Completed generator context.</param>
+        private static void CommitLayerGenerationContext(PsdLayerGenerationContext context)
+        {
+            currentDepth = context.CurrentDepth;
+            currentSortingOrder = context.CurrentSortingOrder;
         }
 
         /// <summary>
@@ -3336,46 +2736,9 @@
         /// <param name="layer">The <see cref="Layer"/> to create a <see cref="TextMesh"/> from.</param>
         private static void CreateTextGameObject(Layer layer)
         {
-            Color color = ApplyLayerOpacity(layer.FillColor, layer);
-
-            float x = layer.Rect.x / PixelsToUnits;
-            float y = layer.Rect.y / PixelsToUnits;
-            y = (CanvasSize.y / PixelsToUnits) - y;
-            float width = layer.Rect.width / PixelsToUnits;
-            float height = layer.Rect.height / PixelsToUnits;
-
-            GameObject gameObject = new GameObject(GetRuntimeObjectName(layer));
-            gameObject.transform.position = new Vector3(x + (width / 2), y - (height / 2), currentDepth);
-            gameObject.transform.parent = currentGroupGameObject.transform;
-
-            currentDepth -= depthStep;
-
-            Font font = GetFontForLayer(layer);
-
-            MeshRenderer meshRenderer = gameObject.AddComponent<MeshRenderer>();
-            meshRenderer.material = font.material;
-            meshRenderer.sortingOrder = currentSortingOrder++;
-
-            TextMesh textMesh = gameObject.AddComponent<TextMesh>();
-            textMesh.text = layer.Text;
-            textMesh.font = font;
-            textMesh.fontSize = 0;
-            textMesh.characterSize = layer.FontSize / PixelsToUnits;
-            textMesh.color = color;
-            textMesh.anchor = TextAnchor.MiddleCenter;
-
-            switch (layer.Justification)
-            {
-                case TextJustification.Left:
-                    textMesh.alignment = TextAlignment.Left;
-                    break;
-                case TextJustification.Right:
-                    textMesh.alignment = TextAlignment.Right;
-                    break;
-                case TextJustification.Center:
-                    textMesh.alignment = TextAlignment.Center;
-                    break;
-            }
+            PsdLayerGenerationContext context = CreateLayerGenerationContext();
+            LayerObjectGeneratorRegistry.TextMeshGenerator.Generate(layer, context);
+            CommitLayerGenerationContext(context);
         }
 
         /// <summary>
@@ -3385,22 +2748,10 @@
         /// <returns>The <see cref="SpriteRenderer"/> component attached to the new sprite <see cref="GameObject"/>.</returns>
         private static SpriteRenderer CreateSpriteGameObject(Layer layer)
         {
-            float x = layer.Rect.x / PixelsToUnits;
-            float y = layer.Rect.y / PixelsToUnits;
-            y = (CanvasSize.y / PixelsToUnits) - y;
-            float width = layer.Rect.width / PixelsToUnits;
-            float height = layer.Rect.height / PixelsToUnits;
-
-            GameObject gameObject = new GameObject(GetRuntimeObjectName(layer));
-            gameObject.transform.position = new Vector3(x + (width / 2), y - (height / 2), currentDepth);
-            gameObject.transform.parent = currentGroupGameObject.transform;
-
-            currentDepth -= depthStep;
-
-            SpriteRenderer spriteRenderer = gameObject.AddComponent<SpriteRenderer>();
-            spriteRenderer.sprite = CreateSprite(layer);
-            spriteRenderer.sortingOrder = currentSortingOrder++;
-            return spriteRenderer;
+            PsdLayerGenerationContext context = CreateLayerGenerationContext();
+            SpriteRenderer renderer = (SpriteRenderer)LayerObjectGeneratorRegistry.SpriteRendererGenerator.Generate(layer, context);
+            CommitLayerGenerationContext(context);
+            return renderer;
         }
 
         /// <summary>
@@ -3607,19 +2958,10 @@
         /// <returns>The newly constructed Image object.</returns>
         private static Image CreateUIImage(Layer layer)
         {
-            LayerImportInfo info = GetLayerInfo(layer);
-            AnchorNamePreset preset = info != null ? info.AnchorPreset : AnchorNamePreset.None;
-
-            GameObject uiObject = new GameObject(GetRuntimeObjectName(layer), typeof(RectTransform));
-            uiObject.transform.SetParent(currentGroupGameObject.transform, false);
-
-            RectTransform uiTransform = uiObject.GetComponent<RectTransform>();
-            ApplyLayerUILayout(uiTransform, layer, preset);
-
-            Image uiImage = uiObject.AddComponent<Image>();
-            uiImage.sprite = CreateSprite(layer);
-            ApplyImageLayoutBehavior(uiImage, preset);
-            return uiImage;
+            PsdLayerGenerationContext context = CreateLayerGenerationContext();
+            Image image = (Image)LayerObjectGeneratorRegistry.UIImageGenerator.Generate(layer, context);
+            CommitLayerGenerationContext(context);
+            return image;
         }
 
         /// <summary>
@@ -3628,55 +2970,9 @@
         /// <param name="layer">The <see cref="Layer"/> used to create the <see cref="UnityEngine.UI.Text"/> from.</param>
         private static void CreateUIText(Layer layer)
         {
-            LayerImportInfo info = GetLayerInfo(layer);
-            AnchorNamePreset preset = info != null ? info.AnchorPreset : AnchorNamePreset.None;
-
-            Color color = ApplyLayerOpacity(layer.FillColor, layer);
-
-            GameObject uiObject = new GameObject(GetRuntimeObjectName(layer), typeof(RectTransform));
-            uiObject.transform.SetParent(currentGroupGameObject.transform, false);
-
-            RectTransform uiTransform = uiObject.GetComponent<RectTransform>();
-            ApplyLayerUILayout(uiTransform, layer, preset);
-
-            Font font = GetFontForLayer(layer);
-
-            Text textUI = uiObject.AddComponent<Text>();
-            textUI.text = layer.Text;
-            textUI.font = font;
-
-            float fontSize = GetUIFontSize(layer);
-            float ceiling = Mathf.Ceil(fontSize);
-            if (fontSize > 0f && fontSize < ceiling)
-            {
-                textUI.fontSize = (int)ceiling;
-                if (!IsGlobalAnchorPreset(preset))
-                {
-                    float scaleFactor = ceiling / fontSize;
-                    textUI.rectTransform.sizeDelta *= scaleFactor;
-                    textUI.rectTransform.localScale /= scaleFactor;
-                }
-            }
-            else
-            {
-                textUI.fontSize = Mathf.Max(1, (int)ceiling);
-            }
-
-            textUI.color = color;
-            textUI.alignment = TextAnchor.MiddleCenter;
-
-            switch (layer.Justification)
-            {
-                case TextJustification.Left:
-                    textUI.alignment = TextAnchor.MiddleLeft;
-                    break;
-                case TextJustification.Right:
-                    textUI.alignment = TextAnchor.MiddleRight;
-                    break;
-                case TextJustification.Center:
-                    textUI.alignment = TextAnchor.MiddleCenter;
-                    break;
-            }
+            PsdLayerGenerationContext context = CreateLayerGenerationContext();
+            LayerObjectGeneratorRegistry.UITextGenerator.Generate(layer, context);
+            CommitLayerGenerationContext(context);
         }
 
         /// <summary>
@@ -3692,16 +2988,6 @@
             Image image = CreateUIImage(layer);
             Button button = image.gameObject.AddComponent<Button>();
             UiLayoutContext buttonLayoutContext = GetChildUILayoutContext(layer, buttonPreset, GetLayerLayoutRect(layer));
-
-            // look through the children for a clip rect
-            ////Rectangle? clipRect = null;
-            ////foreach (Layer child in layer.Children)
-            ////{
-            ////    if (child.Name.ContainsIgnoreCase("|ClipRect"))
-            ////    {
-            ////        clipRect = child.Rect;
-            ////    }
-            ////}
 
             // look through the children for the sprite states
             foreach (Layer child in layer.Children)
@@ -3739,7 +3025,7 @@
                 else if (childInfo.ButtonRole == ButtonChildRole.Default)
                 {
                     image.sprite = CreateSprite(child);
-                    ApplyImageLayoutBehavior(image, buttonPreset);
+                    UIImageLayoutBehavior.Apply(image, buttonPreset, IsGlobalAnchorPreset);
                     button.targetGraphic = image;
                 }
                 else if (childInfo.ButtonRole == ButtonChildRole.TextImage)
@@ -3855,40 +3141,6 @@
                 LocalRectSize = childSize,
                 LocalDisplayRect = GetCenteredRect(childSize)
             };
-        }
-
-        /// <summary>
-        /// Applies the default image preserve-aspect behavior for generated UI images.
-        /// </summary>
-        /// <param name="image">The generated image.</param>
-        /// <param name="preset">Resolved anchor preset.</param>
-        private static void ApplyImageLayoutBehavior(Image image, AnchorNamePreset preset)
-        {
-            if (image == null)
-            {
-                return;
-            }
-
-            image.preserveAspect = true;
-
-            AspectRatioFitter fitter = image.GetComponent<AspectRatioFitter>();
-            if (!IsGlobalAnchorPreset(preset) || image.sprite == null || image.sprite.rect.height <= 0f)
-            {
-                if (fitter != null)
-                {
-                    UnityEngine.Object.DestroyImmediate(fitter);
-                }
-
-                return;
-            }
-
-            if (fitter == null)
-            {
-                fitter = image.gameObject.AddComponent<AspectRatioFitter>();
-            }
-
-            fitter.aspectMode = AspectRatioFitter.AspectMode.EnvelopeParent;
-            fitter.aspectRatio = image.sprite.rect.width / image.sprite.rect.height;
         }
 
         /// <summary>
@@ -4014,21 +3266,6 @@
         }
 
         /// <summary>
-        /// Gets the UI font size used by generated Unity UI text.
-        /// </summary>
-        /// <param name="layer">Source PSD text layer.</param>
-        /// <returns>Scaled UI font size.</returns>
-        private static float GetUIFontSize(Layer layer)
-        {
-            if (UseTargetCanvasCoordinates)
-            {
-                return layer.FontSize * GetTargetCanvasUniformScale();
-            }
-
-            return layer.FontSize / PixelsToUnits;
-        }
-
-        /// <summary>
         /// Gets the effective layout rect for a layer, falling back to the raw PSD rect when needed.
         /// </summary>
         /// <param name="layer">Source PSD layer.</param>
@@ -4042,19 +3279,6 @@
             }
 
             return layer != null ? layer.Rect : default(Rect);
-        }
-
-        /// <summary>
-        /// Applies Photoshop layer opacity to a Unity color.
-        /// </summary>
-        /// <param name="color">Base color.</param>
-        /// <param name="layer">Source PSD layer.</param>
-        /// <returns>Color with layer opacity applied on alpha.</returns>
-        private static Color ApplyLayerOpacity(Color color, Layer layer)
-        {
-            float layerOpacity = layer != null ? layer.Opacity / (float)byte.MaxValue : 1f;
-            color.a = Mathf.Clamp01(color.a) * layerOpacity;
-            return color;
         }
 
         /// <summary>
